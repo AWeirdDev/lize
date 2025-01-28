@@ -1,0 +1,11 @@
+[package]
+name = "lize"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.95"
+smallvec = { version = "1.13.2", features = ["write"] }
+
+[dev-dependencies]
+bincode = "1.3.3"
