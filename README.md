@@ -1,60 +1,72 @@
 # `lize`
-A very stupid way of serializing and deserializing data into bytes. I mean, the performance is essentially the same as `bincode` (which is really disappointing), so there's nothing to really see here.
-
-`lize` supports recursive data structures.
-
-First, we create a `Value`.
+A stupid way of serializing data into a slice.
 
 ```rust
-use lize::{N, Result, SmallVec, Value};
+use lize::Value;
 
-// We support HashMap's!
+// You can create hashmaps like so:
 let value = Value::HashMap(vec![
-    // Some simple values
     (Value::Slice(b"hello"), Value::Slice(b"world")),
-    (Value::Slice(b"money"), Value::Int(6969694200)),
-    
-    // A bit more *advanced* values, :smirk:
-    (
-        Value::Slice(b"do_chores"),
-        Value::Optional(Some(Box::new(Value::Bool(true))))
-    ),
+    (Value::Slice(b"money"), Value::I64(6969694200)),
+]);
 
-    // ...doing taxes is optional he said.
-    (
-        Value::Slice(b"do_taxes"),
-        Value::Optional(None)
-    )
+// ..then serialize it into a SmallVec (recommended)
+let mut buffer = lize::SmallVec::<[u8; lize::STACK_N]>::new();
+value.serialize_into(&mut buffer)?;
+
+// Alternatively, you can serialize it into a Vec.
+// That'd be more convenient.
+// let buffer = value.serialize()?;
+
+// Then, we can take a look at our deserialized data.
+let deserialized = Value::deserialize_from(&buffer)?;
+println!("{deserialized:?}");
+
+let mut buffer = SmallVec::<[u8; lize::STACK_N]>::new();
+value.serialize_into(&mut buffer)?;
+```
+
+# `Value`
+There are some other cool usages other than just hashmaps.
+
+```rust
+let value = Value::Vector(vec![
+    Value::Bool(true),
+    Value::Slice(b"hello"),
+
+    Value::F64(std::f64::consts::PI),
+    Value::I64(1234567890123456789),
+    Value::I32(123456789),
+
+    Value::Optional(Some(Box::new(Value::Slice(b"world")))),
+    Value::Optional(None),
+
+    Value::U8(1_u8),
+    Value::SmallU8(123_u8) // Must be <= 235. Occupies a single byte.
 ]);
 ```
 
-Then, we can serialize it into a buffer, then deserialize it back.
+Of course, if you would, you can use `Value::from(...)` instead of doing that manually. Saves time!
 
 ```rust
-// We can serialize into a (small)vec...
-let mut buf = SmallVec::<[u8; N]>::new();
-value.serialize_into(&mut buf)?;
+let a = 123_i64;
+let v = Value::from(a);
 
-// ...and deserialize back
-let deserialized = Value::deserialize_from(&buf)?;
+assert!(matches!(v, Value::I64(_)));
 ```
 
-Finally... `match`-ing time!
+# (de)serializing directly
+You can use `serialize(...)` and `deserialize(...)` to have the Bincode-like interface.
 
 ```rust
-match deserialized {
-    Value::Int(i) => println!("Int: {:?}", i),
-    Value::Slice(s) => println!("Slice: {:?}", s),
+let a = 123_i64;
+let ser = serialize(a)?;
 
-    // ...so on and so forth
+let b: i64 = deserialize(&ser)?;
 
-    // A Value::SliceLike will never be reached!!
-    // It's designed to act like a Value::Slice, but for Vec's.
-    // Therefore, it can only be matched as a Value::Slice above.
-    Value::SliceLike(_) => unreachable!(),
-}
+assert_eq!(a, b);
 ```
 
 ***
 
-(c) 2024 [AWeirdDev](https://github.com/AWeirdDev)
+(c) 2025 [AWeirdDev](https://github.com/AWeirdDev)
