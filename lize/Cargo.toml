@@ -1,6 +1,6 @@
 [package]
 name = "lize"
-description = "A stupid way of serializing and deserializing data into bytes that supports recursive data structures."
+description = "A stupid way of serializing and deserializing really small data into bytes. Supports recursive data structures."
 authors = ["AWeirdDev <https://github.com/AWeirdDev>"]
 repository = "https://github.com/AWeirdDev/lize"
 license = "MIT"

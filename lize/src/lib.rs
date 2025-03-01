@@ -1,4 +1,4 @@
-//! A very stupid way of serializing and deserializing data into bytes.
+//! A very stupid way of serializing and deserializing really small data into bytes.
 
 use std::io::Write;
 
