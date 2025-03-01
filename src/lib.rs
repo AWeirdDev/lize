@@ -1,650 +1,377 @@
-//! A very stupid way of serializing and deserializing data into bytes.
+use core::str;
 
-use std::io::Write;
+use anyhow::{Context, Result};
 
-pub use anyhow::Result;
-pub use smallvec::SmallVec;
+use lize_sys::{SmallVec, Value, STACK_N};
+use pyo3::{
+    exceptions,
+    prelude::*,
+    types::{PyBytes, PyDict, PyFunction, PyNone, PyString, PyTuple},
+    IntoPyObjectExt,
+};
 
-pub const STACK_N: usize = 128;
-
-/// Represents a value.
-///
-/// # Example
-/// ```rust
-/// use lize::Value;
-///
-/// let value = Value::from(1234_i64);
-/// assert_eq!(value, Value::I64(1234));
-/// ```
-#[derive(Debug, PartialEq)]
-pub enum Value<'a> {
-    /// A 64-bit signed integer. (code: `0`)
-    I64(i64),
-
-    /// A slice of bytes. (code: `1`)
-    Slice(&'a [u8]),
-
-    /// A vector of values. (code: `2`, ends with `3`)
-    Vector(Vec<Value<'a>>),
-
-    /// A map of values. (code: `4`, ends with `5`)
-    HashMap(Vec<(Value<'a>, Value<'a>)>),
-
-    /// A boolean. (code: `6`, `7`)
-    Bool(bool),
-
-    /// A 64-bit float. (code: `8`)
-    F64(f64),
-
-    /// An optional value. (code: `9`, `10` for `None`)
-    Optional(Option<Box<Value<'a>>>),
-
-    /// A `SliceLike` acts like a slice when deserializing, which will be never reached.
-    /// This is created for uses where you cannot use the reference of the slice or lifetime errors.
-    SliceLike(Vec<u8>),
-
-    /// A 32-bit signed integer. (code: `11`)
-    I32(i32),
-
-    /// A 32-bit float. (code: `12`)
-    F32(f32),
-
-    /// A 8-bit unsigned integer. (code: `13`)
-    U8(u8),
-
-    /// A small u8. Must be <= 235. Occupies a single byte.
-    SmallU8(u8),
+#[pyclass]
+pub enum Runnable {
+    /// Coming soon (tm)
+    JustInTime(),
+    Marshal {
+        marshal: Py<PyModule>,
+        bytes: Py<PyAny>,
+        name: Py<PyAny>,
+        annotations: Py<PyAny>,
+        runnable: Option<Py<PyAny>>,
+        defaults: Py<PyAny>,
+        closure: Py<PyAny>,
+    },
 }
 
-impl<'a> Value<'a> {
-    /// Creates a new value.
-    pub fn new<T>(x: T) -> Self
-    where
-        T: Into<Value<'a>>,
-    {
-        x.into()
+#[pymethods]
+impl Runnable {
+    #[staticmethod]
+    pub fn jit() -> Self {
+        Self::JustInTime()
     }
 
-    pub fn serialize(&self) -> Result<Vec<u8>> {
-        let mut buf = SmallVec::<[u8; STACK_N]>::new();
-        self.serialize_into(&mut buf)?;
+    #[staticmethod]
+    pub fn from_pyfn(py: Python<'_>, r#fn: Py<PyFunction>) -> PyResult<Self> {
+        let function = r#fn.bind(py);
+        let marshal = py.import("marshal")?;
 
-        Ok(buf.drain(..).collect())
+        let bytes = marshal
+            .getattr("dumps")?
+            .call1((function.getattr("__code__")?,))?
+            .unbind();
+
+        Ok(Self::Marshal {
+            marshal: marshal.unbind(),
+            bytes,
+            name: function.getattr("__name__")?.unbind(),
+            annotations: function.getattr("__annotations__")?.unbind(),
+            defaults: function.getattr("__defaults__")?.unbind(),
+            closure: function.getattr("__closure__")?.unbind(),
+            runnable: None,
+        })
     }
 
-    pub fn serialize_into(&self, buffer: &mut SmallVec<[u8; STACK_N]>) -> Result<()> {
+    #[pyo3(name = "run", signature = (*args, **kwargs))]
+    pub fn run(
+        &self,
+        py: Python<'_>,
+        args: Py<PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         match self {
-            Self::I64(i) => {
-                buffer.write_all(&[0])?;
-                buffer.write_all(&i.to_le_bytes())?;
-            }
-            Self::Slice(s) => {
-                buffer.write_all(&[1])?;
-
-                let ln = s.len() as u8;
-                buffer.write_all(&ln.to_le_bytes())?;
-                buffer.write_all(&s)?;
-            }
-            Self::Vector(v) => {
-                buffer.write_all(&[2])?;
-
-                for item in v {
-                    let mut buf = SmallVec::<[u8; STACK_N]>::new();
-                    item.serialize_into(&mut buf)?;
-
-                    let ln = buf.len() as u8;
-                    buffer.write_all(&ln.to_le_bytes())?;
-                    buffer.write_all(&buf)?;
+            Runnable::JustInTime() => todo!(),
+            Runnable::Marshal {
+                marshal,
+                bytes,
+                name,
+                annotations,
+                defaults,
+                closure,
+                runnable,
+            } => {
+                if let Some(r) = runnable {
+                    return r.call(py, args, kwargs);
                 }
 
-                buffer.write_all(&[3])?;
+                let code = marshal.getattr(py, "loads")?.call1(py, (bytes,))?;
+                let types = py.import("types")?;
+                let ft = types.getattr("FunctionType")?.call1((
+                    code,
+                    PyDict::new(py),
+                    name,
+                    defaults,
+                    closure,
+                ))?;
+                ft.setattr("__annotations__", annotations)?;
+
+                Ok(ft.call(args, kwargs)?.unbind())
             }
-            Self::HashMap(h) => {
-                buffer.write_all(&[4])?;
+        }
+    }
 
-                for (key, value) in h {
-                    let mut keybuf = SmallVec::<[u8; STACK_N]>::new();
-                    let mut valbuf = SmallVec::<[u8; STACK_N]>::new();
-                    key.serialize_into(&mut keybuf)?;
-                    value.serialize_into(&mut valbuf)?;
+    #[pyo3(name = "__call__", signature = (*args, **kwargs))]
+    pub fn __call__(
+        &self,
+        py: Python<'_>,
+        args: Py<PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.run(py, args, kwargs)
+    }
 
-                    let ln_key = keybuf.len() as u8;
-                    buffer.write_all(&ln_key.to_le_bytes())?;
-                    buffer.write_all(&keybuf)?;
+    pub fn as_bytes(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        match self {
+            Self::JustInTime() => todo!(),
+            Self::Marshal { .. } => {
+                println!("working...");
+                let value = self.as_lize(py)?;
+                println!("ok");
 
-                    let ln_val = valbuf.len() as u8;
-                    buffer.write_all(&ln_val.to_le_bytes())?;
-                    buffer.write_all(&valbuf)?;
+                let mut buffer = SmallVec::<[u8; STACK_N]>::new();
+                value.serialize_into(&mut buffer)?;
+
+                let bytes = PyBytes::new(py, &buffer);
+                Ok(bytes.unbind())
+            }
+        }
+    }
+
+    #[staticmethod]
+    pub fn from_bytes(py: Python<'_>, bytes: &[u8]) -> PyResult<Self> {
+        let value = Value::deserialize_from(bytes)?;
+        match value {
+            Value::Vector(vec) => {
+                if vec.len() != 3 {
+                    return Err(exceptions::PyValueError::new_err(
+                        "Invalid marshal'd object for lize",
+                    ));
                 }
 
-                buffer.write_all(&[5])?;
+                let bytes = vec[0].as_slice().unwrap();
+                let name = str::from_utf8(vec[1].as_slice().unwrap())?;
+                let defaults = lize_to_py(py, &vec[2])?;
+
+                let marshal = py.import("marshal")?;
+
+                Ok(Self::Marshal {
+                    marshal: marshal.unbind(),
+                    bytes: PyBytes::new(py, bytes).unbind().into_any(),
+                    name: PyString::new(py, name).unbind().into_any(),
+                    annotations: py.None(),
+                    runnable: None,
+                    defaults,
+                    closure: py.None(),
+                })
             }
-            Self::Bool(b) => {
-                if *b {
-                    buffer.write_all(&[6])?;
+            _ => Err(exceptions::PyValueError::new_err("Invalid marshal")),
+        }
+    }
+
+    pub fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        match self {
+            Self::JustInTime() => todo!(),
+            Self::Marshal {
+                marshal: _,
+                bytes: _,
+                name,
+                annotations,
+                ..
+            } => {
+                if let Ok(ann) = annotations.bind(py).downcast_exact::<PyDict>() {
+                    let py_ann = ann
+                        .iter()
+                        .filter(|(k, _)| k.extract::<&str>().unwrap() != "return")
+                        .map(|(k, v)| {
+                            format!(
+                                "{}: {}",
+                                k.extract::<&str>().unwrap_or("?"),
+                                v.getattr("__name__")
+                                    .map(|v| v.to_string())
+                                    .unwrap_or(String::from("?"))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let result = format!(
+                        "Runnable(<marshal> {}({}) -> {})",
+                        name.bind(py).to_string(),
+                        py_ann,
+                        ann.get_item("return")?
+                            .map(|v| v
+                                .getattr("__name__")
+                                .map(|v| v.to_string())
+                                .unwrap_or(String::from("?")))
+                            .unwrap_or(String::from("?")),
+                    );
+
+                    Ok(result)
                 } else {
-                    buffer.write_all(&[7])?;
+                    Ok(format!(
+                        "Runnable(<marshal> {}(...) -> ?)",
+                        name.bind(py).to_string()
+                    ))
                 }
             }
-            Self::F64(f) => {
-                buffer.write_all(&[8])?;
-                buffer.write_all(&f.to_le_bytes())?;
-            }
-            Self::Optional(value) => match value {
-                Some(bv) => {
-                    buffer.write_all(&[9])?;
-                    let mut buf = SmallVec::<[u8; STACK_N]>::new();
-                    bv.serialize_into(&mut buf)?;
+        }
+    }
+}
 
-                    let ln = buf.len() as u8;
-                    buffer.write_all(&ln.to_le_bytes())?;
-                    buffer.write_all(&buf)?;
+impl<'a> Runnable {
+    fn as_lize(&'a self, py: Python<'a>) -> PyResult<Value<'a>> {
+        match self {
+            Self::JustInTime() => todo!(),
+            Self::Marshal {
+                marshal: _,
+                bytes,
+                name,
+                annotations: _,
+                runnable: _,
+                defaults,
+                closure: _,
+            } => Ok(Value::Vector(vec![
+                Value::Slice(bytes.extract::<&[u8]>(py)?),          // bytes
+                Value::Slice(name.extract::<&str>(py)?.as_bytes()), // name
+                py_to_lize(py, defaults.extract(py)?)?,             // defaults
+            ])),
+        }
+    }
+}
+
+#[derive(Debug, FromPyObject, IntoPyObject)]
+pub enum PyValue {
+    Str(String),
+    U8(u8),
+    Int32(i32),
+    Int(i64),
+    Float32(f32),
+    Float(f64),
+    Bool(bool),
+    Vec(Vec<Py<PyAny>>),
+    Map(Py<PyDict>),
+    Run(Py<Runnable>),
+    Callable(Py<PyFunction>),
+    #[allow(dead_code)]
+    None(Py<PyNone>),
+}
+
+#[pyfunction]
+pub fn serialize(py: Python<'_>, value: PyValue) -> Result<Bound<'_, PyBytes>> {
+    let lz = py_to_lize(py, value)?;
+    let mut buf = SmallVec::<[u8; STACK_N]>::new();
+    lz.serialize_into(&mut buf)?;
+
+    let bytes = PyBytes::new(py, &buf);
+    Ok(bytes)
+}
+
+#[pyfunction]
+pub fn deserialize(py: Python<'_>, bytes: &[u8]) -> Result<Py<PyAny>> {
+    let lize_value = Value::deserialize_from(bytes)?;
+    let value = lize_to_py(py, &lize_value)?;
+    Ok(value)
+}
+
+fn py_to_lize(py: Python<'_>, value: PyValue) -> Result<Value<'_>> {
+    match value {
+        PyValue::Bool(b) => Ok(Value::Bool(b)),
+        PyValue::Float32(f) => Ok(Value::F32(f)),
+        PyValue::Float(f) => Ok(Value::F64(f)),
+        PyValue::U8(u) => {
+            if u <= 235 {
+                Ok(Value::SmallU8(u))
+            } else {
+                Ok(Value::U8(u))
+            }
+        }
+        PyValue::Int32(i) => Ok(Value::I32(i)),
+        PyValue::Int(i) => Ok(Value::I64(i)),
+        PyValue::Str(s) => Ok(Value::SliceLike(format!("s{}", s).into())),
+        PyValue::Map(m) => {
+            let binding = m.bind(py);
+            let mut lize_value = vec![];
+
+            for (k, v) in binding {
+                let key = py_to_lize(
+                    py,
+                    k.extract()
+                        .context(format!("Failed to extract key for dict {:?}", binding))?,
+                )?;
+                let val = py_to_lize(
+                    py,
+                    v.extract()
+                        .context(format!("Failed to extract value for dict {:?}", binding))?,
+                )?;
+                lize_value.push((key, val));
+            }
+
+            Ok(Value::HashMap(lize_value))
+        }
+        PyValue::None(_) => Ok(Value::Optional(None)),
+        PyValue::Vec(mut v) => {
+            let mut lize_value = vec![];
+
+            for item in v.drain(..) {
+                lize_value.push(py_to_lize(py, item.extract::<PyValue>(py)?)?);
+            }
+
+            Ok(Value::Vector(lize_value))
+        }
+        PyValue::Run(runnable) => {
+            let binding = runnable.bind(py);
+            let mut data = binding.get().as_lize(py)?.serialize()?;
+            data.insert(0, b'r');
+            Ok(Value::SliceLike(data))
+        }
+        PyValue::Callable(callable) => {
+            let runnable = Runnable::from_pyfn(py, callable)?;
+            let mut data = runnable.as_lize(py)?.serialize()?;
+            data.insert(0, b'r');
+            Ok(Value::SliceLike(data))
+        }
+    }
+}
+
+fn lize_to_py(py: Python<'_>, lize_value: &Value<'_>) -> Result<Py<PyAny>> {
+    match lize_value {
+        Value::Bool(b) => Ok(PyValue::Bool(*b).into_py_any(py)?),
+
+        Value::U8(u) => Ok(PyValue::Int(*u as i64).into_py_any(py)?),
+        Value::SmallU8(u) => Ok(PyValue::Int(*u as i64).into_py_any(py)?),
+
+        Value::F32(f) => Ok(PyValue::Float(*f as f64).into_py_any(py)?),
+        Value::F64(f) => Ok(PyValue::Float(*f).into_py_any(py)?),
+
+        Value::I32(i) => Ok(PyValue::Int(*i as i64).into_py_any(py)?),
+        Value::I64(i) => Ok(PyValue::Int(*i).into_py_any(py)?),
+
+        Value::Slice(sl) => {
+            if let Ok(s) = str::from_utf8(&sl[0..1]) {
+                if s == "s" {
+                    Ok(PyValue::Str(String::from_utf8_lossy(&sl[1..]).to_string())
+                        .into_py_any(py)?)
+                } else if s == "r" {
+                    Ok(Runnable::from_bytes(py, &sl[1..])?.into_py_any(py)?)
+                } else {
+                    Ok(PyValue::Str(s.to_string()).into_py_any(py)?)
                 }
-                None => buffer.write_all(&[10])?,
-            },
-            Self::SliceLike(v) => {
-                buffer.write_all(&[1])?;
-
-                let ln = v.len() as u8;
-                buffer.write_all(&ln.to_le_bytes())?;
-                buffer.write_all(&v)?;
-            }
-            Self::I32(i) => {
-                buffer.write_all(&[11])?;
-                buffer.write_all(&i.to_le_bytes())?;
-            }
-            Self::F32(f) => {
-                buffer.write_all(&[12])?;
-                buffer.write_all(&f.to_le_bytes())?;
-            }
-            Self::U8(u) => {
-                buffer.write_all(&[13])?;
-                buffer.write_all(&u.to_le_bytes())?;
-            }
-            Self::SmallU8(u) => {
-                // 20 because we may never reach there.
-                if u > &235 {
-                    return Err(anyhow::anyhow!("SmallU8 must be less than or equal to 235"));
-                }
-                buffer.write_all(&(u + 20).to_le_bytes())?;
+            } else {
+                Err(anyhow::anyhow!("Invalid slice"))
             }
         }
+        Value::SliceLike(_) => unreachable!(),
 
-        Ok(())
-    }
-
-    pub fn deserialize_from(slice: &'a [u8]) -> Result<Self> {
-        let tag = &slice[0];
-        match tag {
-            0 => {
-                let i = i64::from_le_bytes(slice[1..9].try_into()?);
-                Ok(Self::I64(i))
+        Value::HashMap(m) => {
+            let map = PyDict::new(py);
+            for (k, v) in m {
+                let k = lize_to_py(py, k)?;
+                let v = lize_to_py(py, v)?;
+                map.set_item(k, v)?;
             }
-            1 => {
-                let ln = u8::from_le_bytes(slice[1..2].try_into()?) as usize;
-                Ok(Self::Slice(&slice[2..(2 + ln)]))
+
+            Ok(PyValue::Map(map.unbind()).into_py_any(py)?)
+        }
+
+        Value::Optional(_) => Ok(py.None().into_py_any(py)?),
+        Value::Vector(v) => {
+            let mut vec = vec![];
+            for item in v {
+                vec.push(lize_to_py(py, item)?);
             }
-            2 => {
-                let mut offset = 1_usize;
-                let mut data: Vec<Value> = vec![];
 
-                // [
-                //     0    1      2~2   |  3
-                //     TAG, LEN=1, DATA  |
-                //                       ^ offset = 2 + 1
-                // ]
-                loop {
-                    let ln = u8::from_le_bytes(slice[offset..offset + 1].try_into()?) as usize;
-                    let s = &slice[(offset + 1)..(offset + 1 + ln)];
-                    data.push(Value::deserialize_from(s)?);
-                    offset += 1 + ln;
-
-                    if &slice[offset] == &3 {
-                        break;
-                    }
-                }
-
-                Ok(Self::Vector(data))
-            }
-            4 => {
-                let mut offset = 1_usize;
-                let mut data: Vec<(Value, Value)> = vec![];
-
-                loop {
-                    let ln_key = u8::from_le_bytes(slice[offset..offset + 1].try_into()?) as usize;
-                    let d = &slice[(offset + 1)..(offset + 1 + ln_key)];
-                    let key = Value::deserialize_from(d)?;
-                    offset += 1 + ln_key;
-
-                    let ln_val = u8::from_le_bytes(slice[offset..offset + 1].try_into()?) as usize;
-                    let d = &slice[(offset + 1)..(offset + 1 + ln_val)];
-                    let value = Value::deserialize_from(d)?;
-                    offset += 1 + ln_val;
-
-                    data.push((key, value));
-
-                    if &slice[offset] == &5 {
-                        break;
-                    }
-                }
-
-                Ok(Value::HashMap(data))
-            }
-            6 => Ok(Value::Bool(true)),
-            7 => Ok(Value::Bool(false)),
-            8 => {
-                let f = f64::from_le_bytes(slice[1..9].try_into()?);
-                Ok(Value::F64(f))
-            }
-            9 => {
-                let ln = u8::from_le_bytes(slice[1..2].try_into()?) as usize;
-                let d = &slice[2..(2 + ln)];
-                let value = Value::deserialize_from(d)?;
-                Ok(Value::Optional(Some(Box::new(value))))
-            }
-            10 => Ok(Value::Optional(None)),
-            11 => {
-                let i = i32::from_le_bytes(slice[1..5].try_into()?);
-                Ok(Value::I32(i))
-            }
-            12 => {
-                let f = f32::from_le_bytes(slice[1..5].try_into()?);
-                Ok(Value::F32(f))
-            }
-            13 => Ok(Value::U8(u8::from_le_bytes(slice[1..2].try_into()?))),
-            _ if tag >= &20 => Ok(Value::SmallU8(tag - 20)),
-            _ => Err(anyhow::anyhow!("Unknown tag: {}", tag)),
-        }
-    }
-
-    pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Value::I64(i) => Some(*i),
-            _ => None,
-        }
-    }
-
-    pub fn as_i32(&self) -> Option<i32> {
-        match self {
-            Value::I32(i) => Some(*i),
-            _ => None,
-        }
-    }
-
-    pub fn as_f64(&self) -> Option<f64> {
-        match self {
-            Value::F64(f) => Some(*f),
-            _ => None,
-        }
-    }
-
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            Value::F32(f) => Some(*f),
-            _ => None,
-        }
-    }
-
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    pub fn as_slice(&self) -> Option<&'a [u8]> {
-        match self {
-            Value::Slice(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    pub fn as_vec_for_slice(&self) -> Option<Vec<u8>> {
-        match self {
-            Value::Slice(s) => Some(s.to_vec()),
-            _ => None,
-        }
-    }
-
-    pub fn as_str(&self) -> Option<&'a str> {
-        match self {
-            Value::Slice(s) => Some(std::str::from_utf8(s).ok()?),
-            _ => None,
-        }
-    }
-
-    pub fn as_u8(&self) -> Option<u8> {
-        match self {
-            Value::U8(u) => Some(*u),
-            Value::SmallU8(u) => Some(*u),
-            _ => None,
+            Ok(PyValue::Vec(vec).into_py_any(py)?)
         }
     }
 }
 
-impl<'a> From<&'a str> for Value<'a> {
-    fn from(s: &'a str) -> Self {
-        Value::Slice(s.as_bytes())
-    }
-}
-
-impl<'a> From<Value<'a>> for &'a str {
-    fn from(value: Value<'a>) -> Self {
-        match value {
-            Value::Slice(s) => std::str::from_utf8(s).unwrap(),
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl<'a> From<&'a [u8]> for Value<'a> {
-    fn from(s: &'a [u8]) -> Self {
-        Value::Slice(s)
-    }
-}
-
-impl<'a> From<Value<'a>> for &'a [u8] {
-    fn from(value: Value<'a>) -> Self {
-        match value {
-            Value::Slice(s) => s,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<i64> for Value<'_> {
-    fn from(i: i64) -> Self {
-        Value::I64(i)
-    }
-}
-
-impl From<Value<'_>> for i64 {
-    fn from(value: Value<'_>) -> Self {
-        value.as_i64().unwrap()
-    }
-}
-
-impl From<u8> for Value<'_> {
-    fn from(i: u8) -> Self {
-        Value::U8(i)
-    }
-}
-
-impl From<Value<'_>> for u8 {
-    fn from(value: Value<'_>) -> Self {
-        value.as_u8().unwrap()
-    }
-}
-
-impl From<i32> for Value<'_> {
-    fn from(i: i32) -> Self {
-        Value::I32(i)
-    }
-}
-
-impl From<f32> for Value<'_> {
-    fn from(f: f32) -> Self {
-        Value::F32(f)
-    }
-}
-
-impl From<Value<'_>> for f32 {
-    fn from(value: Value<'_>) -> Self {
-        value.as_f32().unwrap()
-    }
-}
-
-impl From<f64> for Value<'_> {
-    fn from(f: f64) -> Self {
-        Value::F64(f)
-    }
-}
-
-impl From<Value<'_>> for f64 {
-    fn from(value: Value<'_>) -> Self {
-        value.as_f64().unwrap()
-    }
-}
-
-impl From<bool> for Value<'_> {
-    fn from(b: bool) -> Self {
-        Value::Bool(b)
-    }
-}
-
-impl<'a, T> From<Option<T>> for Value<'a>
-where
-    Value<'a>: From<T>,
-{
-    fn from(o: Option<T>) -> Self {
-        Value::Optional(o.map(|item| Box::new(Value::from(item))))
-    }
-}
-
-impl<'a> From<std::collections::HashMap<Value<'a>, Value<'a>>> for Value<'a> {
-    fn from(m: std::collections::HashMap<Value<'a>, Value<'a>>) -> Self {
-        Value::HashMap(m.into_iter().collect())
-    }
-}
-
-impl<'a, K, V> From<Value<'a>> for std::collections::HashMap<K, V>
-where
-    K: From<Value<'a>> + std::hash::Hash + Eq,
-    V: From<Value<'a>>,
-{
-    fn from(value: Value<'a>) -> Self {
-        match value {
-            Value::HashMap(m) => {
-                let mut map = std::collections::HashMap::new();
-
-                for (k, v) in m {
-                    map.insert(K::from(k), V::from(v));
-                }
-
-                map
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl<'a, T> From<Vec<T>> for Value<'a>
-where
-    Value<'a>: From<T>,
-{
-    fn from(v: Vec<T>) -> Self {
-        Value::Vector(v.into_iter().map(|item| Value::from(item)).collect())
-    }
-}
-
-impl<'a, T> From<Value<'a>> for Vec<T>
-where
-    T: From<Value<'a>>,
-{
-    fn from(value: Value<'a>) -> Self {
-        match value {
-            Value::Vector(v) => v.into_iter().map(|item| T::from(item)).collect(),
-            _ => unreachable!(),
-        }
-    }
-}
-
-/// Serialize a value.
-///
-/// # Example
-///
-/// ```ignore
-/// let a: i64 = 100;
-/// let b: i64 = deserialize(&serialize(a)?)?;
-///
-/// assert_eq!(a, b);
-/// ```
-pub fn serialize<'a, T>(d: T) -> Result<Vec<u8>>
-where
-    Value<'a>: From<T>,
-{
-    let v = Value::from(d);
-    v.serialize()
-}
-
-/// Deserialize a value.
-///
-/// # Example
-///
-/// ```ignore
-/// let a: i64 = 100;
-/// let b: i64 = deserialize(&serialize(a)?)?;
-///
-/// assert_eq!(a, b);
-/// ```
-pub fn deserialize<'a, T>(bytes: &'a [u8]) -> Result<T>
-where
-    T: From<Value<'a>>,
-{
-    let v = Value::deserialize_from(bytes)?;
-    Ok(v.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_int() -> Result<()> {
-        let value = Value::I64(8787);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        value.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(deserialized, value);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_slice() -> Result<()> {
-        let data = b"There's no time to rest!";
-        let value = Value::Slice(data);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        value.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(deserialized, value);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_vec() -> Result<()> {
-        let value = Value::Vector(vec![
-            Value::I64(1234),
-            Value::Slice(b"do you wanna hide a body?"),
-        ]);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        value.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(deserialized, value);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_hashmap() -> Result<()> {
-        let value = Value::HashMap(vec![
-            (Value::Slice(b"hello"), Value::Slice(b"world")),
-            (Value::Slice(b"money"), Value::I64(6969694200)),
-        ]);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        value.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(value, deserialized);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_boolean() -> Result<()> {
-        let data = Value::Vector(vec![Value::Bool(true), Value::Bool(false)]);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        data.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(deserialized, data);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_float() -> Result<()> {
-        let data = Value::F64(-3.14159265358979363846);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        data.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(deserialized, data);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_optional() -> Result<()> {
-        let data = Value::Optional(Some(Box::new(Value::Vector(vec![Value::Bool(true)]))));
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        data.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-        if let Value::Optional(None) = deserialized {
-            return Err(anyhow::anyhow!("Expected a value"));
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_small_u8() -> Result<()> {
-        let data = Value::SmallU8(2);
-
-        let mut buffer = SmallVec::<[u8; STACK_N]>::new();
-        data.serialize_into(&mut buffer)?;
-
-        let deserialized = Value::deserialize_from(&buffer)?;
-
-        assert_eq!(deserialized, data);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_from() -> Result<()> {
-        let a = 123_i64;
-        let v = Value::from(a);
-
-        assert!(matches!(v, Value::I64(_)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_serde() -> Result<()> {
-        let a = vec![123_i64];
-        let b: Vec<i64> = deserialize(&serialize(a.clone())?)?;
-
-        assert_eq!(a, b);
-        Ok(())
-    }
+/// A Python module implemented in Rust.
+#[pymodule]
+fn lize(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(serialize, m)?)?;
+    m.add_function(wrap_pyfunction!(deserialize, m)?)?;
+    m.add_class::<Runnable>()?;
+
+    Ok(())
 }

@@ -1,0 +1,16 @@
+[package]
+name = "lize"
+description = "A stupid way of serializing and deserializing data into bytes that supports recursive data structures."
+authors = ["AWeirdDev <https://github.com/AWeirdDev>"]
+repository = "https://github.com/AWeirdDev/lize"
+license = "MIT"
+readme = "README.md"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.96"
+smallvec = { version = "1.13.2", features = ["write"] }
+
+[dev-dependencies]
+bincode = "1.3.3"

@@ -21,9 +21,6 @@ permissions:
 jobs:
   linux:
     runs-on: ${{ matrix.platform.runner }}
-    defaults:
-      run:
-        working-directory: lize_python
     strategy:
       matrix:
         platform:
@@ -59,9 +56,6 @@ jobs:
 
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
-    defaults:
-      run:
-        working-directory: lize_python
     strategy:
       matrix:
         platform:
@@ -93,9 +87,6 @@ jobs:
 
   windows:
     runs-on: ${{ matrix.platform.runner }}
-    defaults:
-      run:
-        working-directory: lize_python
     strategy:
       matrix:
         platform:
@@ -123,9 +114,6 @@ jobs:
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
-    defaults:
-      run:
-        working-directory: lize_python
     strategy:
       matrix:
         platform:
@@ -152,9 +140,6 @@ jobs:
 
   sdist:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: lize_python
     steps:
       - uses: actions/checkout@v4
       - name: Build sdist
@@ -171,9 +156,6 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: lize_python
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     needs: [linux, musllinux, windows, macos, sdist]
     permissions:

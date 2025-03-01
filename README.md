@@ -1,72 +1,33 @@
-# `lize`
-A stupid way of serializing data into a slice.
+# lize
+Serialize/deserialize data into bytes. Designed for **really** small data.
 
-```rust
-use lize::Value;
+- **[🦀 Rust `lize`](https://github.com/AWeirdDev/lize/tree/main/lize)**
+- [🐍 Python](https://github.com/AWeirdDev/lize)
+- [🟡 PyPi](https://pypi.org/project/lize/)
 
-// You can create hashmaps like so:
-let value = Value::HashMap(vec![
-    (Value::Slice(b"hello"), Value::Slice(b"world")),
-    (Value::Slice(b"money"), Value::I64(6969694200)),
-]);
+## Python
 
-// ..then serialize it into a SmallVec (recommended)
-let mut buffer = lize::SmallVec::<[u8; lize::STACK_N]>::new();
-value.serialize_into(&mut buffer)?;
+```python
+from lize import deserialize, serialize
 
-// Alternatively, you can serialize it into a Vec.
-// That'd be more convenient.
-// let buffer = value.serialize()?;
+# You can serialize numbers, strings and more.
+s = serialize(["Hello, World!", 100, 3.14, {"python": "cool"}])
 
-// Then, we can take a look at our deserialized data.
-let deserialized = Value::deserialize_from(&buffer)?;
-println!("{deserialized:?}");
-
-let mut buffer = SmallVec::<[u8; lize::STACK_N]>::new();
-value.serialize_into(&mut buffer)?;
+# ..and then deserialize it
+d: list = deserialize(s)
 ```
 
-# `Value`
-There are some other cool usages other than just hashmaps.
+Additionally, you can also serialize and deserialize **functions**. Again, small functions.
 
-```rust
-let value = Value::Vector(vec![
-    Value::Bool(true),
-    Value::Slice(b"hello"),
+```python
+from typing import Callable
 
-    Value::F64(std::f64::consts::PI),
-    Value::I64(1234567890123456789),
-    Value::I32(123456789),
+def add(a: int, b: int, k: float) -> float:
+    return (a + b) * k
 
-    Value::Optional(Some(Box::new(Value::Slice(b"world")))),
-    Value::Optional(None),
+s = serialize(add)
+d: Callable[[int, int, float], int] = deserialize(s)
 
-    Value::U8(1_u8),
-    Value::SmallU8(123_u8) // Must be <= 235. Occupies a single byte.
-]);
+print(d)
+# Runnable(<marshal> add(...) -> ?)
 ```
-
-Of course, if you would, you can use `Value::from(...)` instead of doing that manually. Saves time!
-
-```rust
-let a = 123_i64;
-let v = Value::from(a);
-
-assert!(matches!(v, Value::I64(_)));
-```
-
-# (de)serializing directly
-You can use `serialize(...)` and `deserialize(...)` to have the Bincode-like interface.
-
-```rust
-let a = 123_i64;
-let ser = serialize(a)?;
-
-let b: i64 = deserialize(&ser)?;
-
-assert_eq!(a, b);
-```
-
-***
-
-(c) 2025 [AWeirdDev](https://github.com/AWeirdDev)
