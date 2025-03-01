@@ -11,7 +11,8 @@ use pyo3::{
 };
 
 #[pyclass]
-enum Runnable {
+pub enum Runnable {
+    /// Coming soon (tm)
     JustInTime(),
     Marshal {
         marshal: Py<PyModule>,
@@ -90,23 +91,23 @@ impl Runnable {
         }
     }
 
-    pub fn into_bytes(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+    #[pyo3(name = "__call__", signature = (*args, **kwargs))]
+    pub fn __call__(
+        &self,
+        py: Python<'_>,
+        args: Py<PyTuple>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.run(py, args, kwargs)
+    }
+
+    pub fn as_bytes(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
         match self {
             Self::JustInTime() => todo!(),
-            Self::Marshal {
-                marshal: _,
-                bytes,
-                name,
-                annotations: _,
-                runnable: _,
-                defaults,
-                closure: _,
-            } => {
-                let value = Value::Vector(vec![
-                    Value::Slice(bytes.extract::<&[u8]>(py)?), // bytes
-                    Value::Slice(name.extract::<&[u8]>(py)?),  // name
-                    py_to_lize(py, defaults.extract(py)?)?,    // defaults
-                ]);
+            Self::Marshal { .. } => {
+                println!("working...");
+                let value = self.as_lize(py)?;
+                println!("ok");
 
                 let mut buffer = SmallVec::<[u8; STACK_N]>::new();
                 value.serialize_into(&mut buffer)?;
@@ -147,16 +148,91 @@ impl Runnable {
             _ => Err(exceptions::PyValueError::new_err("Invalid marshal")),
         }
     }
+
+    pub fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        match self {
+            Self::JustInTime() => todo!(),
+            Self::Marshal {
+                marshal: _,
+                bytes: _,
+                name,
+                annotations,
+                ..
+            } => {
+                if let Ok(ann) = annotations.bind(py).downcast_exact::<PyDict>() {
+                    let py_ann = ann
+                        .iter()
+                        .filter(|(k, _)| k.extract::<&str>().unwrap() != "return")
+                        .map(|(k, v)| {
+                            format!(
+                                "{}: {}",
+                                k.extract::<&str>().unwrap_or("?"),
+                                v.getattr("__name__")
+                                    .map(|v| v.to_string())
+                                    .unwrap_or(String::from("?"))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    let result = format!(
+                        "Runnable(<marshal> {}({})) -> {}",
+                        name.bind(py).to_string(),
+                        py_ann,
+                        ann.get_item("return")?
+                            .map(|v| v
+                                .getattr("__name__")
+                                .map(|v| v.to_string())
+                                .unwrap_or(String::from("?")))
+                            .unwrap_or(String::from("?")),
+                    );
+
+                    Ok(result)
+                } else {
+                    Ok(format!(
+                        "Runnable(<marshal> {}(...) -> ?)",
+                        name.bind(py).to_string()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Runnable {
+    fn as_lize(&'a self, py: Python<'a>) -> PyResult<Value<'a>> {
+        match self {
+            Self::JustInTime() => todo!(),
+            Self::Marshal {
+                marshal: _,
+                bytes,
+                name,
+                annotations: _,
+                runnable: _,
+                defaults,
+                closure: _,
+            } => Ok(Value::Vector(vec![
+                Value::Slice(bytes.extract::<&[u8]>(py)?),          // bytes
+                Value::Slice(name.extract::<&str>(py)?.as_bytes()), // name
+                py_to_lize(py, defaults.extract(py)?)?,             // defaults
+            ])),
+        }
+    }
 }
 
 #[derive(Debug, FromPyObject, IntoPyObject)]
 pub enum PyValue {
     Str(String),
+    U8(u8),
+    Int32(i32),
     Int(i64),
+    Float32(f32),
     Float(f64),
     Bool(bool),
     Vec(Vec<Py<PyAny>>),
     Map(Py<PyDict>),
+    Run(Py<Runnable>),
+    Callable(Py<PyFunction>),
     #[allow(dead_code)]
     None(Py<PyNone>),
 }
@@ -181,7 +257,16 @@ pub fn deserialize(py: Python<'_>, bytes: &[u8]) -> Result<Py<PyAny>> {
 fn py_to_lize(py: Python<'_>, value: PyValue) -> Result<Value<'_>> {
     match value {
         PyValue::Bool(b) => Ok(Value::Bool(b)),
+        PyValue::Float32(f) => Ok(Value::F32(f)),
         PyValue::Float(f) => Ok(Value::F64(f)),
+        PyValue::U8(u) => {
+            if u <= 235 {
+                Ok(Value::SmallU8(u))
+            } else {
+                Ok(Value::U8(u))
+            }
+        }
+        PyValue::Int32(i) => Ok(Value::I32(i)),
         PyValue::Int(i) => Ok(Value::I64(i)),
         PyValue::Str(s) => Ok(Value::SliceLike(format!("s{}", s).into())),
         PyValue::Map(m) => {
@@ -214,6 +299,18 @@ fn py_to_lize(py: Python<'_>, value: PyValue) -> Result<Value<'_>> {
 
             Ok(Value::Vector(lize_value))
         }
+        PyValue::Run(runnable) => {
+            let binding = runnable.bind(py);
+            let mut data = binding.get().as_lize(py)?.serialize()?;
+            data.insert(0, b'r');
+            Ok(Value::SliceLike(data))
+        }
+        PyValue::Callable(callable) => {
+            let runnable = Runnable::from_pyfn(py, callable)?;
+            let mut data = runnable.as_lize(py)?.serialize()?;
+            data.insert(0, b'r');
+            Ok(Value::SliceLike(data))
+        }
     }
 }
 
@@ -230,8 +327,18 @@ fn lize_to_py(py: Python<'_>, lize_value: &Value<'_>) -> Result<Py<PyAny>> {
         Value::I32(i) => Ok(PyValue::Int(*i as i64).into_py_any(py)?),
         Value::I64(i) => Ok(PyValue::Int(*i).into_py_any(py)?),
 
-        Value::Slice(s) => {
-            Ok(PyValue::Str(String::from_utf8_lossy(s).to_string()).into_py_any(py)?)
+        Value::Slice(sl) => {
+            if let Ok(s) = str::from_utf8(&sl[0..1]) {
+                if s == "s" {
+                    Ok(PyValue::Str(s[1..].to_string()).into_py_any(py)?)
+                } else if s == "r" {
+                    Ok(Runnable::from_bytes(py, &sl[1..])?.into_py_any(py)?)
+                } else {
+                    Ok(PyValue::Str(s.to_string()).into_py_any(py)?)
+                }
+            } else {
+                Err(anyhow::anyhow!("Invalid slice"))
+            }
         }
         Value::SliceLike(_) => unreachable!(),
 

@@ -69,7 +69,7 @@ impl<'a> Value<'a> {
         let mut buf = SmallVec::<[u8; STACK_N]>::new();
         self.serialize_into(&mut buf)?;
 
-        Ok(buf.to_vec())
+        Ok(buf.drain(..).collect())
     }
 
     pub fn serialize_into(&self, buffer: &mut SmallVec<[u8; STACK_N]>) -> Result<()> {

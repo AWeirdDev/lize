@@ -4,6 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "lize"
+description = "Serialize/deserialize data into bytes just like pickle, but crab."
+keywords = ["serialize", "serializer", "deserialize", "deserializer", "pickle"]
+authors = [
+  { name = "AWeirdDev", email = "aweirdscratcher@gmail.com" },
+]
+license = { file = "LICENSE" }
+readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
     "Programming Language :: Rust",
@@ -11,10 +18,13 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+
+
 [project.optional-dependencies]
 tests = [
     "pytest",
 ]
+
 [tool.maturin]
 python-source = "python"
 features = ["pyo3/extension-module"]
