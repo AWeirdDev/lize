@@ -5,7 +5,7 @@ authors = ["AWeirdDev <https://github.com/AWeirdDev>"]
 repository = "https://github.com/AWeirdDev/lize"
 license = "MIT"
 readme = "README.md"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
